@@ -18,6 +18,10 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -105,7 +109,20 @@ class ZaiApiService @Inject constructor(
     }
 
     suspend fun createChat(title: String): ChatListItemResponse = withContext(Dispatchers.IO) {
-        val payload = json.encodeToString(mapOf("title" to title))
+        // FE parity (reverse-engineered from the deployed bundle): the route
+        // expects {"chat": {...chat object...}}, NOT {"title": "..."} — the old
+        // shape was answered with HTTP 400 (Pydantic validation) on every
+        // attempt. Minimal chat object mirrors the frontend's new-chat payload.
+        val chatId = UUID.randomUUID().toString()
+        val chatObj = buildJsonObject {
+            put("id", chatId)
+            put("title", title)
+            put("models", json.encodeToJsonElement(listOf(ZaiConfig.MODEL_DEFAULT)))
+            putJsonObject("history") { putJsonObject("messages") {} }
+            put("tags", json.encodeToJsonElement(emptyList<String>()))
+            put("timestamp", System.currentTimeMillis())
+        }
+        val payload = json.encodeToString(buildJsonObject { put("chat", chatObj) })
         val http = Request.Builder()
             .url("${ZaiConfig.BASE_URL}${ZaiConfig.CHATS_PATH}new")
             .post(payload.toRequestBody(jsonMediaType))
