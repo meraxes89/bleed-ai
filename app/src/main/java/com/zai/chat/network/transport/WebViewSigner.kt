@@ -136,14 +136,48 @@ class WebViewSigner @Inject constructor(
         }
     }
 
+    /**
+     * Mints a single-use `captcha_verify_param` ticket.
+     *
+     * The JS harness resolves EVERY path through the bridge callbacks
+     * (success / sdk-error / closed / fail-retry-exhausted / mint-timeout),
+     * so this continuation can no longer hang in silence the way the old
+     * harness did (user logcat 2026-10-23: six mints, zero callbacks, every
+     * one timing out at exactly 10s with a len=0 ticket).
+     *
+     * Timeout budget: the JS fail-safe fires at 12s (covering the SDK's own
+     * 10s timeout plus the one automatic fail-retry), so 15s here guarantees
+     * the bridge error callback — with its precise reason — arrives first.
+     */
     suspend fun mint(): String {
-        return withTimeoutOrNull(10000L) {
+        val started = android.os.SystemClock.elapsedRealtime()
+        val ticket = withTimeoutOrNull(MINT_TIMEOUT_MS) {
             suspendCancellableCoroutine { continuation ->
                 activeContinuation = continuation
                 mainHandler.post {
-                    webView.evaluateJavascript("window.__ZaiSigner && window.__ZaiSigner.mint();", null)
+                    webView.evaluateJavascript(
+                        "(window.__ZaiSigner && window.__ZaiSigner.mint()) ? 1 : 0",
+                        null
+                    )
                 }
             }
         } ?: ""
+
+        if (ticket.isEmpty()) {
+            val elapsed = android.os.SystemClock.elapsedRealtime() - started
+            Log.w("BleedAI-Signer", "Mint produced no ticket after ${elapsed}ms; diagnosing engine state...")
+            mainHandler.post {
+                webView.evaluateJavascript(
+                    "window.__ZaiSigner ? (window.__ZaiSigner.isReady() ? 'engine_ready' : 'engine_not_ready') : 'page_dead'"
+                ) { state ->
+                    Log.w("BleedAI-Signer", "Signer engine state: $state")
+                }
+            }
+        }
+        return ticket
+    }
+
+    private companion object {
+        const val MINT_TIMEOUT_MS = 15_000L
     }
 }

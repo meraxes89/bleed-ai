@@ -23,15 +23,18 @@ import java.io.IOException
  * Handles: "data:" payloads, ":" keepalive comments, [DONE], implicit
  * end-of-stream (server closed without [DONE] -> treated as clean Done).
  *
- * IN-STREAM ERROR SURFACING (the "silent empty Done" fix):
+ * IN-STREAM ERROR SURFACING + V2 PROTOCOL (the "silent empty Done" fix):
  * The completions endpoint reports rejections (FRONTEND_CAPTCHA_REQUIRED,
- * auth errors, model errors) as HTTP 200 bodies containing a JSON object with
- * `code`/`detail` — either bare or wrapped in a `data:` line. The reader used
- * to skip undecodable payloads and non-"data:" lines, so the stream ended
- * clean and empty and the UI said "Empty response from model" while the real
- * cause stayed invisible. Both shapes are now decoded: a payload that parses
- * as an error object (no choices + code/detail present) terminates the stream
- * with [StreamEvent.Error] carrying the backend's own message.
+ * "Model not available for current user level", auth errors) as HTTP 200
+ * bodies containing an error object NESTED in the payload (error /
+ * data.error / data.data.error — live-verified shapes). It also streams
+ * content as v2 deltas (data.delta_content + data.phase), NOT the OpenAI
+ * v1 choices shape. The old reader understood neither: v2 errors were
+ * skipped as undecodable, v2 deltas dropped as empty chunks, and the UI
+ * said "Empty response from model" while the backend had replied with a
+ * precise, actionable rejection. Both protocols are now decoded, and an
+ * error payload terminates the stream with [StreamEvent.Error] carrying
+ * the backend's own message.
  */
 class ManualSseReader(
     private val responseBody: ResponseBody,
@@ -57,6 +60,30 @@ class ManualSseReader(
                 return true                                            // terminal — stop reading
             }
 
+            // V2 protocol deltas (live-verified): data.delta_content + data.phase.
+            // "answer" → visible text, "thinking" → reasoning channel,
+            // tool_call/tool_response → internal plumbing the UI never renders.
+            chunk.deltaContent?.takeIf { it.isNotEmpty() }?.let { delta ->
+                when (chunk.deltaPhase) {
+                    "thinking" -> {
+                        reasoning.append(delta)
+                        emit(StreamEvent.ReasoningDelta(delta))
+                    }
+                    "answer", null, "" -> {
+                        content.append(delta)
+                        emit(StreamEvent.ContentDelta(delta))
+                    }
+                    else -> Unit                                       // tool phases — not user-facing
+                }
+            }
+
+            // V2 full-content messages (non-incremental).
+            chunk.fullContent?.takeIf { it.isNotEmpty() }?.let { full ->
+                content.append(full)
+                emit(StreamEvent.ContentDelta(full))
+            }
+
+            // V1/OpenAI-compat fallback (choices[].delta) for older gateways.
             chunk.choices.firstOrNull()?.delta?.let { delta ->
                 delta.reasoningContent?.takeIf { it.isNotEmpty() }?.let {
                     reasoning.append(it)
