@@ -4,14 +4,29 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /** [RECON] Inbound SSE chunk. GLM streams content and reasoning as two
- *  independent delta channels inside the same chunk format. */
+ *  independent delta channels inside the same chunk format.
+ *
+ *  [code]/[detail] model the in-stream REJECTION payloads the completions
+ *  endpoint returns with HTTP 200 (e.g. FRONTEND_CAPTCHA_REQUIRED), verified
+ *  by live probes: the gate answers 200 + error JSON in the body rather than
+ *  a 4xx, so the SSE reader must be able to recognize and surface them. */
 @Serializable
 data class ChatCompletionChunk(
     @SerialName("id") val id: String? = null,
     @SerialName("choices") val choices: List<ChunkChoice> = emptyList(),
     @SerialName("usage") val usage: UsageInfo? = null,
-    @SerialName("citations") val citations: List<CitationItem>? = null
-)
+    @SerialName("citations") val citations: List<CitationItem>? = null,
+    @SerialName("code") val code: String? = null,
+    @SerialName("detail") val detail: String? = null
+) {
+    /** True when this chunk is an in-stream error object, not a completion delta. */
+    val isErrorPayload: Boolean
+        get() = choices.isEmpty() && (code != null || detail != null)
+
+    /** Human-readable one-liner for logs / error banners. */
+    val errorDescription: String
+        get() = "Backend rejected: [$code] ${detail ?: "no detail"}"
+}
 
 @Serializable
 data class ChunkChoice(
