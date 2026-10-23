@@ -70,14 +70,18 @@ class NativeCompletionTransport @Inject constructor(
         val userId = claims?.subject ?: "user"
         val promptText = request.messages.lastOrNull { it.role == "user" }?.content.orEmpty()
 
+        // Captcha mint FIRST, signature LAST: the mint can block for many
+        // seconds (on-demand risk round-trip). Signing before the wait used
+        // to dispatch requests with a 48s-stale signature_timestamp — the
+        // timestamp must be generated as close to dispatch as possible.
+        val ticket = tokenPool.acquireToken()
+        Log.d("BleedAI-NativeTransport", "Acquired captcha ticket (len=${ticket.length}): ${ticket.take(16)}...")
+
         val signed = requestSigner.sign(
             prompt = promptText,
             userId = userId,
             token = token
         )
-
-        val ticket = tokenPool.acquireToken()
-        Log.d("BleedAI-NativeTransport", "Acquired captcha ticket (len=${ticket.length}): ${ticket.take(16)}...")
 
         val targetUrl = "${ZaiConfig.BASE_URL}${ZaiConfig.COMPLETIONS_PATH}?${signed.queryParams}&signature_timestamp=${signed.timestamp}"
         val cookies = CookieManager.getInstance().getCookie(ZaiConfig.BASE_URL).orEmpty()
@@ -177,8 +181,10 @@ class NativeCompletionTransport @Inject constructor(
                 }
 
                 // Stream SSE chunks directly via ManualSseReader. In-stream
-                // rejections (HTTP 200 + error JSON) now surface as Error
-                // events — same self-healing captcha retry applies to them.
+                // rejections (HTTP 200 + nested error JSON: captcha gate,
+                // "Model not available for current user level", ...) now
+                // surface as Error events — same self-healing captcha retry
+                // applies to captcha rejections.
                 var retryForCaptcha = false
                 ManualSseReader(responseBody, json).streamEvents().collect { event ->
                     val isCaptchaRejection = event is StreamEvent.Error &&
