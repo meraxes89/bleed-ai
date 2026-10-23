@@ -5,6 +5,7 @@ import android.webkit.CookieManager
 import com.zai.chat.config.ZaiConfig
 import com.zai.chat.data.local.preferences.JwtParser
 import com.zai.chat.data.local.preferences.TokenManager
+import com.zai.chat.network.FeVersionResolver
 import com.zai.chat.network.auth.AuthEventManager
 import com.zai.chat.network.model.ChatCompletionRequest
 import com.zai.chat.network.sse.ManualSseReader
@@ -34,7 +35,9 @@ import javax.inject.Singleton
  * Component 4: High-Performance Native SSE Transport.
  * Streams chat completions directly from the chat.z.ai HTTP/2 endpoint using OkHttp and coroutines.
  * Connects with single-use `captcha_verify_param` minted via `CaptchaTokenPool` and features
- * automatic single-turn self-healing retry on `FRONTEND_CAPTCHA_REQUIRED`.
+ * automatic single-turn self-healing retry on `FRONTEND_CAPTCHA_REQUIRED` — the retry also
+ * force-refreshes the runtime `X-FE-Version` so a mid-session z.ai frontend rotation is
+ * recovered within one round-trip instead of bricking completions until the next app update.
  */
 @Singleton
 class NativeCompletionTransport @Inject constructor(
@@ -43,6 +46,7 @@ class NativeCompletionTransport @Inject constructor(
     private val tokenManager: TokenManager,
     private val requestSigner: RequestSigner,
     private val authEventManager: AuthEventManager,
+    private val feVersionResolver: FeVersionResolver,
     private val json: Json
 ) : CompletionTransport {
 
@@ -105,7 +109,7 @@ class NativeCompletionTransport @Inject constructor(
             .header("Accept", "text/event-stream")
             .header("Content-Type", "application/json")
             .header("Accept-Language", "en-US")
-            .header("X-FE-Version", ZaiConfig.FE_VERSION_HEADER_VALUE)
+            .header("X-FE-Version", feVersionResolver.current())
             .header("X-Signature", signed.signature)
             .apply {
                 if (cookies.isNotBlank()) {
@@ -126,12 +130,15 @@ class NativeCompletionTransport @Inject constructor(
             response.use { resp ->
                 Log.d("BleedAI-NativeTransport", "HTTP Response: ${resp.code} ${resp.message}")
 
-                if (resp.code == 401) {
-                    Log.w("BleedAI-NativeTransport", "HTTP 401 Unauthorized -> emitting token expired event")
+                // z.ai answers dead bearer tokens with 403 "Not authenticated";
+                // 401 kept for upstream Open WebUI parity. Both route the user
+                // to the reconnect screen instead of looping silent failures.
+                if (resp.code == 401 || resp.code == 403) {
+                    Log.w("BleedAI-NativeTransport", "HTTP ${resp.code} -> emitting token expired event")
                     authEventManager.emitTokenExpired()
                     emit(
                         StreamEvent.Error(
-                            throwable = IOException("Session expired (HTTP 401)"),
+                            throwable = IOException("Session expired (HTTP ${resp.code})"),
                             partialContent = "",
                             partialReasoning = ""
                         )
@@ -143,9 +150,12 @@ class NativeCompletionTransport @Inject constructor(
                     val errSnippet = resp.body?.string().orEmpty().take(400)
                     Log.w("BleedAI-NativeTransport", "HTTP Error ${resp.code}: $errSnippet")
 
-                    // Self-healing retry on FRONTEND_CAPTCHA_REQUIRED
+                    // Self-healing retry on FRONTEND_CAPTCHA_REQUIRED: fresh ticket
+                    // AND a forced FE-version re-discovery, since a rotated frontend
+                    // is a prime cause of captcha-gate rejection.
                     if (errSnippet.contains("CAPTCHA") && !isRetry) {
-                        Log.i("BleedAI-NativeTransport", "Captcha challenge triggered -> retrying with fresh ticket...")
+                        Log.i("BleedAI-NativeTransport", "Captcha challenge triggered -> retrying with fresh ticket + FE version refresh...")
+                        feVersionResolver.refreshNow()
                         streamInternal(request, isRetry = true).collect { emit(it) }
                         return@flow
                     }
@@ -166,9 +176,24 @@ class NativeCompletionTransport @Inject constructor(
                     return@flow
                 }
 
-                // Stream SSE chunks directly via ManualSseReader
+                // Stream SSE chunks directly via ManualSseReader. In-stream
+                // rejections (HTTP 200 + error JSON) now surface as Error
+                // events — same self-healing captcha retry applies to them.
+                var retryForCaptcha = false
                 ManualSseReader(responseBody, json).streamEvents().collect { event ->
-                    emit(event)
+                    val isCaptchaRejection = event is StreamEvent.Error &&
+                        event.throwable.message?.contains("CAPTCHA", ignoreCase = true) == true
+                    if (isCaptchaRejection && !isRetry) {
+                        Log.i("BleedAI-NativeTransport", "In-stream captcha rejection -> will retry with fresh ticket + FE version refresh")
+                        retryForCaptcha = true
+                    } else {
+                        emit(event)
+                    }
+                }
+                if (retryForCaptcha) {
+                    feVersionResolver.refreshNow()
+                    streamInternal(request, isRetry = true).collect { emit(it) }
+                    return@flow
                 }
             }
         } catch (e: CancellationException) {
