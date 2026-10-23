@@ -27,6 +27,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.zai.chat.data.local.preferences.JwtParser
 import com.zai.chat.data.local.preferences.SettingsDataStore
 import com.zai.chat.data.local.preferences.TokenManager
 import com.zai.chat.network.auth.AuthEvent
@@ -85,9 +86,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Auto-prompt on cold launch if no valid token exists
+            // Auto-prompt on cold launch if no token exists OR the stored one
+            // is already past its exp claim. Previously an expired JWT passed
+            // this check, the app opened straight into the chat surface, and
+            // every request silently 403'd — the user was stranded with no
+            // re-auth affordance ("can't hit the servers").
             LaunchedEffect(Unit) {
-                if (tokenManager.getStoredToken().isNullOrBlank()) {
+                val stored = tokenManager.getStoredToken()
+                val locallyExpired = JwtParser.parse(stored)?.isExpired == true
+                if (stored.isNullOrBlank() || locallyExpired) {
                     sessionViewModel.onEvent(SessionUiEvent.SetMode(SessionMode.ActiveManagement))
                     navController.navigate("session_management") {
                         launchSingleTop = true

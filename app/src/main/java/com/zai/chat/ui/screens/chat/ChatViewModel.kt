@@ -405,6 +405,13 @@ class ChatViewModel @Inject constructor(
                     Log.e("BleedAI-ChatVM", "Stream error: ${event.throwable.message}")
                     val hasPartial = event.partialContent.isNotEmpty() ||
                         event.partialReasoning.isNotEmpty()
+                    // Prefer the backend's own rejection text (in-stream error
+                    // payloads are now surfaced by the SSE reader) over the old
+                    // generic guess, so the user sees WHY it failed.
+                    val backendDetail = event.throwable.message
+                        ?.trim()
+                        ?.take(200)
+                        ?.takeIf { it.isNotBlank() }
                     _uiState.update {
                         if (hasPartial) {
                             it.copy(awaitingHandoff = true, bannerError = "Stream interrupted")
@@ -413,7 +420,8 @@ class ChatViewModel @Inject constructor(
                                 isStreaming = false,
                                 liveContent = "",
                                 liveReasoning = "",
-                                bannerError = "Connection failed — is a session token set?"
+                                bannerError = backendDetail
+                                    ?: "Connection failed — is a session token set?"
                             )
                         }
                     }
