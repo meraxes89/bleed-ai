@@ -14,6 +14,7 @@ import java.util.Locale
 data class JwtClaims(
     val rawToken: String,
     val subject: String?,
+    val email: String? = null,
     val role: String?,
     val issuer: String?,
     val expiresAtEpochSeconds: Long?,
@@ -39,6 +40,7 @@ object JwtParser {
             val sub = jsonObject["sub"]?.jsonPrimitive?.contentOrNull
                 ?: jsonObject["id"]?.jsonPrimitive?.contentOrNull
                 ?: jsonObject["email"]?.jsonPrimitive?.contentOrNull
+            val email = jsonObject["email"]?.jsonPrimitive?.contentOrNull
             val role = jsonObject["role"]?.jsonPrimitive?.contentOrNull
             val iss = jsonObject["iss"]?.jsonPrimitive?.contentOrNull
 
@@ -56,6 +58,7 @@ object JwtParser {
             JwtClaims(
                 rawToken = cleanToken,
                 subject = sub,
+                email = email,
                 role = role,
                 issuer = iss,
                 expiresAtEpochSeconds = exp,

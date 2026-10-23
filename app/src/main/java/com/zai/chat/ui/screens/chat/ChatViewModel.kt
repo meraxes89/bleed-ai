@@ -9,7 +9,9 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.zai.chat.config.ZaiConfig
+import com.zai.chat.data.local.preferences.JwtParser
 import com.zai.chat.data.local.preferences.SettingsDataStore
+import com.zai.chat.data.local.preferences.TokenManager
 import com.zai.chat.data.model.FileAttachment
 import com.zai.chat.data.model.Message
 import com.zai.chat.data.model.MessageRole
@@ -40,6 +42,7 @@ class ChatViewModel @Inject constructor(
     private val apiService: ZaiApiService,
     val signer: WebViewSigner,
     private val tokenPool: CaptchaTokenPool,
+    private val tokenManager: TokenManager,
     settingsDataStore: SettingsDataStore,
     savedStateHandle: SavedStateHandle,
     @ApplicationContext private val context: Context
@@ -65,6 +68,7 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             apiService.getAvailableModels().let { models ->
                 _uiState.update { it.copy(availableModels = models) }
+                maybeApplyGuestTierDefault(models)
             }
         }
         viewModelScope.launch {
@@ -78,6 +82,30 @@ class ChatViewModel @Inject constructor(
                     _uiState.update { it.copy(selectedModel = model) }
                 }
             }
+        }
+    }
+
+    /**
+     * Guest sessions cannot use the compiled default model (live-verified:
+     * glm-5.3 is tier-gated — the backend answers 200 + in-stream
+     * "Model not available for current user level"). The site's own model
+     * list is ordered with the guest-tier model first (x-preview-l /
+     * GLM-5.3-Flash at probe time), so for guest sessions still sitting on
+     * the compiled default we adopt the first listed model. Users who picked
+     * a model explicitly are never overridden.
+     */
+    private fun maybeApplyGuestTierDefault(models: List<String>) {
+        if (models.isEmpty()) return
+        val claims = tokenManager.getStoredToken()?.let { JwtParser.parse(it) } ?: return
+        val isGuestSession = claims.email
+            ?.startsWith("guest-", ignoreCase = true) == true
+        if (!isGuestSession) return
+        val current = _uiState.value.selectedModel
+        if (current != ZaiConfig.MODEL_DEFAULT) return          // user choice — respect it
+        val guestDefault = models.firstOrNull() ?: return
+        if (guestDefault != current) {
+            Log.i("BleedAI-ChatVM", "Guest session: defaulting model to $guestDefault (tier-available)")
+            _uiState.update { it.copy(selectedModel = guestDefault) }
         }
     }
 
